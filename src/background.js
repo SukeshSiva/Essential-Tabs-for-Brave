@@ -283,6 +283,7 @@ async function consolidateWindows() {
 
   const wins = await chrome.windows.getAll({ windowTypes: ["normal"], populate: true });
   let needsRetry = false;
+  let movedTabs = false;
 
   for (const win of wins) {
     if (win.id === primaryWindowId || win.incognito) continue;
@@ -291,17 +292,20 @@ async function consolidateWindows() {
 
     try {
       await chrome.tabs.move(tabIds, { windowId: primaryWindowId, index: -1 });
+      movedTabs = true;
     } catch {
       needsRetry = true;
     }
   }
 
   // Close any empty leftover windows
-  const updatedWins = await chrome.windows.getAll({ windowTypes: ["normal"], populate: true });
-  for (const win of updatedWins) {
-    if (win.id === primaryWindowId || win.incognito) continue;
-    if (win.tabs.length === 0) {
-      chrome.windows.remove(win.id).catch(() => {});
+  if (movedTabs) {
+    const updatedWins = await chrome.windows.getAll({ windowTypes: ["normal"], populate: true });
+    for (const win of updatedWins) {
+      if (win.id === primaryWindowId || win.incognito) continue;
+      if (win.tabs.length === 0) {
+        chrome.windows.remove(win.id).catch(() => {});
+      }
     }
   }
 
@@ -311,8 +315,8 @@ async function consolidateWindows() {
     setTimeout(consolidateWindows, delay);
   } else {
     consolidateRetries = 0;
-    // Focus the primary window after successful merge
-    if (!needsRetry) {
+    // Only do post-merge cleanup when we actually moved tabs
+    if (movedTabs && !needsRetry) {
       chrome.windows.update(primaryWindowId, { focused: true }).catch(() => {});
 
       // Re-offload any pinned tabs that Chrome accidentally woke up during
