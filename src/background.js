@@ -197,22 +197,36 @@ async function consolidateWindows() {
     populate: true,
   });
 
+  let needsRetry = false;
+
   for (const win of windows) {
     if (win.id === primaryWindowId || win.incognito) continue;
 
     const tabIds = win.tabs.map((t) => t.id);
     if (tabIds.length > 0) {
-      await chrome.tabs.move(tabIds, { windowId: primaryWindowId, index: -1 });
+      try {
+        await chrome.tabs.move(tabIds, { windowId: primaryWindowId, index: -1 });
+      } catch (err) {
+        // Tab move fails if the user is actively holding down the mouse to drag it.
+        // We catch this and flag it to retry.
+        needsRetry = true;
+      }
     }
-    // Window auto-closes when all tabs are moved out
   }
 
-  chrome.windows.update(primaryWindowId, { focused: true });
+  if (needsRetry) {
+    // User is still dragging — check again in a bit
+    setTimeout(consolidateWindows, 300);
+  } else {
+    // Only focus if we actually consolidated something to avoid stealing focus randomly
+    if (windows.length > 1) {
+      chrome.windows.update(primaryWindowId, { focused: true }).catch(() => {});
+    }
+  }
 }
 
 // --- Ensure all tabs stay in the primary window ---
 
-// Debounce consolidation to avoid fighting with Chrome during active drags
 let consolidateTimeout = null;
 
 async function handleWindowChange() {
@@ -221,7 +235,7 @@ async function handleWindowChange() {
 
   if (consolidateTimeout) clearTimeout(consolidateTimeout);
   
-  // Wait 100ms for window/tab events to settle (especially during drags)
+  // Wait a moment for window/tab events to settle
   consolidateTimeout = setTimeout(async () => {
     await consolidateWindows();
   }, 100);
@@ -241,6 +255,27 @@ chrome.windows.onRemoved.addListener((windowId) => {
 });
 
 // --- Startup Offloading ---
-// Ensure pinned tabs are aggressively offloaded when the browser starts
-chrome.runtime.onStartup.addListener(initPinnedTabs);
-chrome.runtime.onInstalled.addListener(initPinnedTabs);
+
+// Aggressively offload pinned tabs (session restore sometimes fights this)
+async function forceOffloadPinned() {
+  const tabs = await chrome.tabs.query({ pinned: true });
+  for (const tab of tabs) {
+    if (!tab.active && !tab.discarded) {
+      chrome.tabs.discard(tab.id).catch(() => {});
+    }
+  }
+}
+
+function handleStartup() {
+  initPinnedTabs();
+  
+  // Brave's session restore loads tabs sequentially. 
+  // We fire offloads at intervals to catch them as they initialize.
+  forceOffloadPinned();
+  setTimeout(forceOffloadPinned, 1000);
+  setTimeout(forceOffloadPinned, 3000);
+  setTimeout(forceOffloadPinned, 5000);
+}
+
+chrome.runtime.onStartup.addListener(handleStartup);
+chrome.runtime.onInstalled.addListener(handleStartup);
