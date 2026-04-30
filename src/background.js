@@ -125,7 +125,7 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
 // --- Prevent pinned tabs from navigating away from their base URL ---
 const recentNavigations = new Set();
 
-chrome.webNavigation.onCommitted.addListener((details) => {
+chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId !== 0) return;
 
   const tabId = details.tabId;
@@ -149,7 +149,7 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 
   chrome.tabs.create({ url: details.url, active: true });
 
-  // Now that the off-origin navigation has committed, goBack will correctly return to the exact previous page!
+  // Abort the pending navigation immediately (zero flash)
   chrome.tabs.goBack(tabId).catch(() => {
     chrome.tabs.update(tabId, { url: baseOrigin + "/" });
   });
