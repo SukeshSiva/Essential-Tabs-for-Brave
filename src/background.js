@@ -1,8 +1,20 @@
-// Map of pinned tab IDs to their base URLs (origin)
-const pinnedTabBaseUrls = new Map();
+// =============================================================================
+// Base URL Lock for Pinned Tabs
+// =============================================================================
+//
+// CRITICAL DESIGN NOTE (MV3):
+// In Manifest V3, the service worker is killed after ~30s of inactivity.
+// When it restarts, ALL in-memory state (Maps, variables) is wiped.
+// We MUST persist pinned tab URLs to chrome.storage.local so the lock
+// survives across service worker restarts.
+// =============================================================================
 
-// Flag to track the 10-second window after the browser boots
+// In-memory cache (fast synchronous access for event listeners)
+let pinnedTabUrls = {}; // { tabId: origin }
+
+// Flag for startup offloading
 let isStartupOffloadActive = false;
+const queuedForDiscard = new Set();
 
 /**
  * Get the origin (base URL) from a full URL.
@@ -16,25 +28,61 @@ function getOrigin(url) {
 }
 
 /**
- * Initialize tracking for all pinned tabs on startup.
+ * Save the current pinned tab URLs to persistent storage.
  */
-async function initPinnedTabs() {
-  const tabs = await chrome.tabs.query({ pinned: true });
-  for (const tab of tabs) {
-    // pendingUrl is available during session restore
-    const url = tab.pendingUrl || tab.url;
-    if (url && url !== "about:blank" && tab.id != null) {
-      pinnedTabBaseUrls.set(tab.id, getOrigin(url));
-    }
+function persistPinnedUrls() {
+  chrome.storage.local.set({ pinnedTabUrls });
+}
+
+/**
+ * Load pinned tab URLs from persistent storage into memory.
+ * This is the FIRST thing that runs when the service worker wakes up.
+ */
+async function loadPinnedUrls() {
+  const data = await chrome.storage.local.get("pinnedTabUrls");
+  if (data.pinnedTabUrls) {
+    pinnedTabUrls = data.pinnedTabUrls;
   }
 }
 
-initPinnedTabs();
+/**
+ * Scan all current pinned tabs and register any that are missing from our map.
+ * Also cleans up entries for tabs that no longer exist or aren't pinned.
+ */
+async function syncPinnedTabs() {
+  const tabs = await chrome.tabs.query({ pinned: true });
+  const currentPinnedIds = new Set();
 
-// --- Extension icon click ---
-// Normal tab: close it
-// Pinned tab: offload it, then cascade to next active pinned tab.
-//             Only go to unpinned new tab once ALL pinned tabs are offloaded.
+  for (const tab of tabs) {
+    const url = tab.pendingUrl || tab.url;
+    if (url && url !== "about:blank" && tab.id != null) {
+      currentPinnedIds.add(String(tab.id));
+      // Only set if we don't already have a lock for this tab
+      if (!pinnedTabUrls[tab.id]) {
+        const origin = getOrigin(url);
+        if (origin && !origin.startsWith("chrome://")) {
+          pinnedTabUrls[tab.id] = origin;
+        }
+      }
+    }
+  }
+
+  // Clean up entries for tabs that no longer exist or are no longer pinned
+  for (const tabId of Object.keys(pinnedTabUrls)) {
+    if (!currentPinnedIds.has(tabId)) {
+      delete pinnedTabUrls[tabId];
+    }
+  }
+
+  persistPinnedUrls();
+}
+
+// --- Boot sequence: load from storage FIRST, then sync with real tabs ---
+loadPinnedUrls().then(() => syncPinnedTabs());
+
+// =============================================================================
+// Extension icon click: offload/cascade
+// =============================================================================
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.pinned) {
     const unpinnedTabs = await chrome.tabs.query({ windowId: tab.windowId, pinned: false });
@@ -64,51 +112,56 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 });
 
-const queuedForDiscard = new Set();
-
-// --- Track when a tab becomes pinned or unpinned ---
+// =============================================================================
+// Track pinned/unpinned state changes + startup offloading
+// =============================================================================
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  const url = changeInfo.pendingUrl || changeInfo.url || tab.pendingUrl || tab.url;
-  const isValidUrl = url && url !== "about:blank" && !url.startsWith("chrome://");
+  // --- Handle unpinning: remove the lock ---
+  if (changeInfo.pinned === false) {
+    delete pinnedTabUrls[tabId];
+    persistPinnedUrls();
+    return;
+  }
 
-  // Ensure we always have the base URL for pinned tabs.
-  // We only set it if it's missing, locking it to whatever it was when it was first pinned/loaded.
+  // --- Handle pinning or loading of a pinned tab ---
   if (tab.pinned) {
-    if (!pinnedTabBaseUrls.has(tabId) && isValidUrl) {
-      pinnedTabBaseUrls.set(tabId, getOrigin(url));
+    const url = tab.pendingUrl || tab.url;
+    const isValidUrl = url && url !== "about:blank" && !url.startsWith("chrome://");
+
+    // Lock the base URL if we don't have one yet for this tab
+    if (!pinnedTabUrls[tabId] && isValidUrl) {
+      pinnedTabUrls[tabId] = getOrigin(url);
+      persistPinnedUrls();
     }
-    
-    // Instant Startup Offload with Favicon Grace Period
+
+    // Startup offloading: discard background pinned tabs with a favicon grace period
     if (isStartupOffloadActive && !tab.active && !tab.discarded && isValidUrl) {
       if (!queuedForDiscard.has(tabId)) {
         queuedForDiscard.add(tabId);
         setTimeout(() => {
           chrome.tabs.get(tabId, (t) => {
+            if (chrome.runtime.lastError) return;
             if (t && !t.active && !t.discarded) {
               chrome.tabs.discard(tabId).catch(() => {});
             }
           });
-        }, 1500); // 1.5s grace period to let the browser cache the favicon
+        }, 1500);
       }
     }
   }
-
-  // If unpinned, remove the lock so the user can change it and repin it.
-  if (changeInfo.pinned === false) {
-    pinnedTabBaseUrls.delete(tabId);
-  }
 });
 
-// --- Handle tab removal ---
+// =============================================================================
+// Handle tab removal
+// =============================================================================
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
-  if (removeInfo.isWindowClosing) {
-    pinnedTabBaseUrls.delete(tabId);
-    return;
-  }
+  // Clean up our tracking
+  delete pinnedTabUrls[tabId];
+  persistPinnedUrls();
+
+  if (removeInfo.isWindowClosing) return;
 
   const windowId = removeInfo.windowId;
-  pinnedTabBaseUrls.delete(tabId);
-
   const remainingTabs = await chrome.tabs.query({ windowId });
   const hasUnpinned = remainingTabs.some((t) => !t.pinned);
 
@@ -122,48 +175,52 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   }
 });
 
-// --- Prevent pinned tabs from navigating away from their base URL ---
+// =============================================================================
+// BASE URL LOCK — the core feature
+// =============================================================================
 const recentNavigations = new Set();
 
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId !== 0) return;
 
   const tabId = details.tabId;
-  const baseOrigin = pinnedTabBaseUrls.get(tabId);
+  const baseOrigin = pinnedTabUrls[tabId];
   if (!baseOrigin) return;
 
   const newOrigin = getOrigin(details.url);
   if (newOrigin === baseOrigin) return;
 
+  // Allow internal chrome pages
   if (
     details.url.startsWith("chrome://") ||
-    details.url.startsWith("chrome-extension://")
+    details.url.startsWith("chrome-extension://") ||
+    details.url.startsWith("brave://")
   )
     return;
 
-  // Prevent duplicate tab creations for the same rapid navigation
+  // Prevent duplicate tab creations for rapid-fire navigations (redirects, double-clicks)
   const navKey = `${tabId}:${details.url}`;
   if (recentNavigations.has(navKey)) return;
   recentNavigations.add(navKey);
-  setTimeout(() => recentNavigations.delete(navKey), 1000);
+  setTimeout(() => recentNavigations.delete(navKey), 2000);
 
+  // Open the blocked URL in a new tab
   chrome.tabs.create({ url: details.url, active: true });
 
-  // Abort the pending navigation immediately without reloading or flashing
-  // We use window.stop() via scripting to freeze the page exactly where it is.
+  // Cancel the navigation on the pinned tab.
+  // We use window.stop() to freeze the page in place without reloading.
   chrome.scripting.executeScript({
     target: { tabId: tabId },
     func: () => window.stop()
   }).catch(() => {
-    // Fallback if scripting fails (e.g., chrome:// URLs which we shouldn't be on anyway)
-    chrome.tabs.goBack(tabId).catch(() => {});
+    // Fallback: force back to the base URL
+    chrome.tabs.update(tabId, { url: baseOrigin + "/" });
   });
 });
 
 // =============================================================================
-// --- Feature: Single Window Mode ---
+// Single Window Mode
 // =============================================================================
-
 let primaryWindowId = null;
 
 async function initPrimaryWindow() {
@@ -216,7 +273,7 @@ async function consolidateWindows() {
       try {
         await chrome.tabs.move(tabIds, { windowId: primaryWindowId, index: -1 });
       } catch (err) {
-        needsRetry = true; // Tab is being dragged by user
+        needsRetry = true;
       }
     }
   }
@@ -248,14 +305,10 @@ chrome.windows.onRemoved.addListener((windowId) => {
 });
 
 // =============================================================================
-// --- Feature: Safe Startup Offloading ---
+// Startup Offloading
 // =============================================================================
-
-// This ONLY fires when the browser physically launches (not just SW waking up)
 chrome.runtime.onStartup.addListener(async () => {
   isStartupOffloadActive = true;
-  
-  // Disable the startup offload aggressive tracking after 10 seconds
   setTimeout(() => {
     isStartupOffloadActive = false;
   }, 10000);
