@@ -64,6 +64,8 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 });
 
+const queuedForDiscard = new Set();
+
 // --- Track when a tab becomes pinned or unpinned ---
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const url = changeInfo.pendingUrl || changeInfo.url || tab.pendingUrl || tab.url;
@@ -76,10 +78,18 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       pinnedTabBaseUrls.set(tabId, getOrigin(url));
     }
     
-    // Instant Startup Offload
-    // If we are in the startup window, instantly discard the tab the millisecond its URL is known
+    // Instant Startup Offload with Favicon Grace Period
     if (isStartupOffloadActive && !tab.active && !tab.discarded && isValidUrl) {
-      chrome.tabs.discard(tabId).catch(() => {});
+      if (!queuedForDiscard.has(tabId)) {
+        queuedForDiscard.add(tabId);
+        setTimeout(() => {
+          chrome.tabs.get(tabId, (t) => {
+            if (t && !t.active && !t.discarded) {
+              chrome.tabs.discard(tabId).catch(() => {});
+            }
+          });
+        }, 1500); // 1.5s grace period to let the browser cache the favicon
+      }
     }
   }
 
@@ -113,7 +123,9 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
 });
 
 // --- Prevent pinned tabs from navigating away from their base URL ---
-chrome.webNavigation.onBeforeNavigate.addListener((details) => {
+const recentNavigations = new Set();
+
+chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId !== 0) return;
 
   const tabId = details.tabId;
@@ -129,8 +141,21 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   )
     return;
 
+  // If the user intentionally changed the URL via address bar or bookmark, update the lock!
+  if (details.transitionType === "typed" || details.transitionType === "auto_bookmark") {
+    pinnedTabBaseUrls.set(tabId, newOrigin);
+    return;
+  }
+
+  // Prevent duplicate tab creations for the same rapid navigation
+  const navKey = `${tabId}:${details.url}`;
+  if (recentNavigations.has(navKey)) return;
+  recentNavigations.add(navKey);
+  setTimeout(() => recentNavigations.delete(navKey), 1000);
+
   chrome.tabs.create({ url: details.url, active: true });
 
+  // Now that the off-origin navigation has committed, goBack will correctly return to the exact previous page!
   chrome.tabs.goBack(tabId).catch(() => {
     chrome.tabs.update(tabId, { url: baseOrigin + "/" });
   });
