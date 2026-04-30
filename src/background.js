@@ -126,3 +126,118 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
     chrome.tabs.update(tabId, { url: baseOrigin + "/" });
   });
 });
+
+// =============================================================================
+// --- Feature: Single Window Mode ---
+// Forces all tabs into one window (excludes private/Tor windows).
+// Toggle via right-click on the extension icon.
+// =============================================================================
+
+let primaryWindowId = null;
+
+/**
+ * Find the primary (first normal, non-incognito) window.
+ */
+async function initPrimaryWindow() {
+  const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+  const normalWindows = windows.filter((w) => !w.incognito);
+  if (normalWindows.length > 0) {
+    // Prefer the focused window, otherwise pick the first one
+    const focused = normalWindows.find((w) => w.focused);
+    primaryWindowId = focused ? focused.id : normalWindows[0].id;
+  }
+}
+
+initPrimaryWindow();
+
+// --- Context menu toggle ---
+const MENU_ID = "toggle-single-window";
+
+chrome.runtime.onInstalled.addListener(async () => {
+  const { singleWindowMode } = await chrome.storage.local.get("singleWindowMode");
+  const enabled = singleWindowMode ?? false;
+
+  chrome.contextMenus.create({
+    id: MENU_ID,
+    title: enabled ? "✅ Single Window Mode" : "⬜ Single Window Mode",
+    contexts: ["action"], // right-click on extension icon
+  });
+});
+
+chrome.contextMenus.onClicked.addListener(async (info) => {
+  if (info.menuItemId !== MENU_ID) return;
+
+  const { singleWindowMode } = await chrome.storage.local.get("singleWindowMode");
+  const newValue = !singleWindowMode;
+  await chrome.storage.local.set({ singleWindowMode: newValue });
+
+  chrome.contextMenus.update(MENU_ID, {
+    title: newValue ? "✅ Single Window Mode" : "⬜ Single Window Mode",
+  });
+
+  // If just enabled, consolidate all existing windows now
+  if (newValue) {
+    await consolidateWindows();
+  }
+});
+
+/**
+ * Move all tabs from other normal windows into the primary window.
+ */
+async function consolidateWindows() {
+  if (!primaryWindowId) await initPrimaryWindow();
+  if (!primaryWindowId) return;
+
+  const windows = await chrome.windows.getAll({
+    windowTypes: ["normal"],
+    populate: true,
+  });
+
+  for (const win of windows) {
+    if (win.id === primaryWindowId || win.incognito) continue;
+
+    const tabIds = win.tabs.map((t) => t.id);
+    if (tabIds.length > 0) {
+      await chrome.tabs.move(tabIds, { windowId: primaryWindowId, index: -1 });
+    }
+    // Window auto-closes when all tabs are moved out
+  }
+
+  chrome.windows.update(primaryWindowId, { focused: true });
+}
+
+// --- Ensure all tabs stay in the primary window ---
+
+async function handleTabEvent() {
+  const { singleWindowMode } = await chrome.storage.local.get("singleWindowMode");
+  if (!singleWindowMode) return;
+  await consolidateWindows();
+}
+
+// When a new window is created, consolidate tabs
+chrome.windows.onCreated.addListener(async (window) => {
+  if (window.incognito || window.type !== "normal") return;
+  await handleTabEvent();
+});
+
+// When a tab is created, consolidate tabs
+chrome.tabs.onCreated.addListener(async (tab) => {
+  const win = await chrome.windows.get(tab.windowId);
+  if (win.incognito || win.type !== "normal") return;
+  await handleTabEvent();
+});
+
+// When a tab is attached to a window (e.g. dragged out), consolidate tabs
+chrome.tabs.onAttached.addListener(async (tabId, attachInfo) => {
+  const win = await chrome.windows.get(attachInfo.newWindowId);
+  if (win.incognito || win.type !== "normal") return;
+  await handleTabEvent();
+});
+
+// --- If primary window is closed, pick a new one ---
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (windowId === primaryWindowId) {
+    primaryWindowId = null;
+    initPrimaryWindow();
+  }
+});
