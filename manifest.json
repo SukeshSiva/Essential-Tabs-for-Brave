@@ -1,7 +1,7 @@
 {
   "name": "Essential Tabs for Brave",
   "description": "Smart pinned tab management — offloading, URL locking, and intelligent tab lifecycle for Brave browser",
-  "version": "3.0.0",
+  "version": "3.1.0",
 
   "author": "SukeshSiva",
   "homepage_url": "https://github.com/SukeshSiva/Essential-Tabs-for-Brave",
@@ -10,8 +10,7 @@
     "tabs",
     "webNavigation",
     "contextMenus",
-    "storage",
-    "declarativeNetRequest"
+    "storage"
   ],
   "icons": {
     "128": "images/icon_128.png"
