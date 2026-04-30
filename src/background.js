@@ -180,6 +180,19 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
 // =============================================================================
 const recentNavigations = new Set();
 
+// Track the last known good full URL for each pinned tab (for fallback)
+const lastGoodUrl = {};
+
+// Keep track of what page each pinned tab is actually showing
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tab.pinned && changeInfo.status === "complete" && tab.url) {
+    const origin = getOrigin(tab.url);
+    if (origin && origin === pinnedTabUrls[tabId]) {
+      lastGoodUrl[tabId] = tab.url;
+    }
+  }
+});
+
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId !== 0) return;
 
@@ -190,7 +203,7 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   const newOrigin = getOrigin(details.url);
   if (newOrigin === baseOrigin) return;
 
-  // Allow internal chrome pages
+  // Allow internal browser pages
   if (
     details.url.startsWith("chrome://") ||
     details.url.startsWith("chrome-extension://") ||
@@ -198,7 +211,7 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   )
     return;
 
-  // Prevent duplicate tab creations for rapid-fire navigations (redirects, double-clicks)
+  // Prevent duplicate tab creations for rapid-fire navigations
   const navKey = `${tabId}:${details.url}`;
   if (recentNavigations.has(navKey)) return;
   recentNavigations.add(navKey);
@@ -208,13 +221,14 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   chrome.tabs.create({ url: details.url, active: true });
 
   // Cancel the navigation on the pinned tab.
-  // We use window.stop() to freeze the page in place without reloading.
+  // window.stop() freezes the page in place without any visible reload.
   chrome.scripting.executeScript({
     target: { tabId: tabId },
     func: () => window.stop()
   }).catch(() => {
-    // Fallback: force back to the base URL
-    chrome.tabs.update(tabId, { url: baseOrigin + "/" });
+    // Fallback: navigate back to the exact page they were on (not just the root)
+    const fallbackUrl = lastGoodUrl[tabId] || baseOrigin + "/";
+    chrome.tabs.update(tabId, { url: fallbackUrl });
   });
 });
 

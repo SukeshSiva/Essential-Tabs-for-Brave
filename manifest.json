@@ -13,6 +13,9 @@
     "storage",
     "scripting"
   ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "icons": {
     "128": "images/icon_128.png"
   },
