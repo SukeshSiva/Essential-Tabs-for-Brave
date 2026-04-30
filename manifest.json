@@ -1,0 +1,20 @@
+{
+  "name": "Lock Pinned Tabs",
+  "description": "Prevents pinned a tab from being closed accidentally",
+  "version": "1.0.0",
+
+  "author": "gustavotrott",
+  "homepage_url": "https://github.com/gustavotrott/brave-lock-pinned-tabs",
+  "manifest_version": 3,
+  "permissions": [
+    "tabs",
+    "webNavigation"
+  ],
+  "icons": {
+    "128": "images/icon_128.png"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {}
+}
