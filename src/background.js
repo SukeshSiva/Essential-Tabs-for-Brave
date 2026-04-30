@@ -1,6 +1,9 @@
 // Map of pinned tab IDs to their base URLs (origin)
 const pinnedTabBaseUrls = new Map();
 
+// Track when the service worker started to aggressively offload tabs during the first 5 seconds
+const STARTUP_TIME = Date.now();
+
 /**
  * Get the origin (base URL) from a full URL.
  */
@@ -18,12 +21,13 @@ function getOrigin(url) {
 async function initPinnedTabs() {
   const tabs = await chrome.tabs.query({ pinned: true });
   for (const tab of tabs) {
-    if (tab.url && tab.id != null) {
-      pinnedTabBaseUrls.set(tab.id, getOrigin(tab.url));
-      // Discard the tab to save memory right at startup
-      if (!tab.discarded && !tab.active) {
-        chrome.tabs.discard(tab.id).catch(() => {});
-      }
+    const url = tab.pendingUrl || tab.url;
+    if (url && tab.id != null) {
+      pinnedTabBaseUrls.set(tab.id, getOrigin(url));
+    }
+    // Discard the tab to save memory right at startup
+    if (!tab.discarded && !tab.active) {
+      chrome.tabs.discard(tab.id).catch(() => {});
     }
   }
 }
@@ -69,10 +73,26 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 });
 
-// --- Track when a tab becomes pinned or unpinned ---
+// --- Track when a tab becomes pinned or unpinned, or loads its URL ---
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.pinned === true && tab.url) {
-    pinnedTabBaseUrls.set(tabId, getOrigin(tab.url));
+  // Aggressive startup offloading: 
+  // If Brave tries to load a pinned tab within 5 seconds of startup, put it back to sleep
+  if (tab.pinned && !tab.active && !tab.discarded && (Date.now() - STARTUP_TIME < 5000)) {
+    chrome.tabs.discard(tabId).catch(() => {});
+  }
+
+  const url = changeInfo.pendingUrl || changeInfo.url || tab.pendingUrl || tab.url;
+
+  // Make sure we capture the base URL if the tab is pinned but we missed it on startup
+  if (tab.pinned && url) {
+    if (!pinnedTabBaseUrls.has(tabId)) {
+      pinnedTabBaseUrls.set(tabId, getOrigin(url));
+    }
+  }
+
+  // Handle explicit pinning actions
+  if (changeInfo.pinned === true && url) {
+    pinnedTabBaseUrls.set(tabId, getOrigin(url));
   }
   if (changeInfo.pinned === false) {
     pinnedTabBaseUrls.delete(tabId);
