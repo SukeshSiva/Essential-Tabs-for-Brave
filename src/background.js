@@ -141,12 +141,6 @@ chrome.webNavigation.onCommitted.addListener((details) => {
   )
     return;
 
-  // If the user intentionally changed the URL via address bar or bookmark, update the lock!
-  if (details.transitionType === "typed" || details.transitionType === "auto_bookmark") {
-    pinnedTabBaseUrls.set(tabId, newOrigin);
-    return;
-  }
-
   // Prevent duplicate tab creations for the same rapid navigation
   const navKey = `${tabId}:${details.url}`;
   if (recentNavigations.has(navKey)) return;
