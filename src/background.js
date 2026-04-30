@@ -310,6 +310,11 @@ async function consolidateWindows() {
     if (!primaryWindowId) return;
   }
 
+  // Snapshot which pinned tabs are ALREADY offloaded before the merge.
+  // We'll only re-offload these specific ones if Chrome wakes them during drag.
+  const pinnedBefore = await chrome.tabs.query({ windowId: primaryWindowId, pinned: true });
+  const wasDiscarded = new Set(pinnedBefore.filter(t => t.discarded).map(t => t.id));
+
   const wins = await chrome.windows.getAll({ windowTypes: ["normal"], populate: true });
   let needsRetry = false;
   let movedTabs = false;
@@ -348,19 +353,20 @@ async function consolidateWindows() {
     if (movedTabs && !needsRetry) {
       chrome.windows.update(primaryWindowId, { focused: true }).catch(() => {});
 
-      // Re-offload any pinned tabs that Chrome accidentally woke up during
-      // the drag (Chrome activates an offloaded tab when all other tabs leave)
-      setTimeout(async () => {
-        const pinnedTabs = await chrome.tabs.query({
-          windowId: primaryWindowId,
-          pinned: true,
-        });
-        for (const pt of pinnedTabs) {
-          if (!pt.active && !pt.discarded) {
-            discardPinnedTab(pt.id);
+      // Re-offload ONLY pinned tabs that were already sleeping before the merge
+      // but got accidentally woken up by Chrome during the drag.
+      if (wasDiscarded.size > 0) {
+        setTimeout(async () => {
+          for (const tabId of wasDiscarded) {
+            try {
+              const pt = await chrome.tabs.get(tabId);
+              if (pt && !pt.active && !pt.discarded) {
+                discardPinnedTab(pt.id);
+              }
+            } catch {} // tab may no longer exist
           }
-        }
-      }, 500); // short delay to let the moved tab settle as active first
+        }, 500);
+      }
     }
   }
 }
