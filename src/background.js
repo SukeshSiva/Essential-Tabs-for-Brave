@@ -1,6 +1,9 @@
 // Map of pinned tab IDs to their base URLs (origin)
 const pinnedTabBaseUrls = new Map();
 
+// Flag to track the 10-second window after the browser boots
+let isStartupOffloadActive = false;
+
 /**
  * Get the origin (base URL) from a full URL.
  */
@@ -63,12 +66,24 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 // --- Track when a tab becomes pinned or unpinned ---
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.pinned === true) {
-    const url = changeInfo.pendingUrl || changeInfo.url || tab.pendingUrl || tab.url;
-    if (url && url !== "about:blank") {
+  const url = changeInfo.pendingUrl || changeInfo.url || tab.pendingUrl || tab.url;
+  const isValidUrl = url && url !== "about:blank" && !url.startsWith("chrome://");
+
+  // Ensure we always have the base URL for pinned tabs.
+  // We only set it if it's missing, locking it to whatever it was when it was first pinned/loaded.
+  if (tab.pinned) {
+    if (!pinnedTabBaseUrls.has(tabId) && isValidUrl) {
       pinnedTabBaseUrls.set(tabId, getOrigin(url));
     }
+    
+    // Instant Startup Offload
+    // If we are in the startup window, instantly discard the tab the millisecond its URL is known
+    if (isStartupOffloadActive && !tab.active && !tab.discarded && isValidUrl) {
+      chrome.tabs.discard(tabId).catch(() => {});
+    }
   }
+
+  // If unpinned, remove the lock so the user can change it and repin it.
   if (changeInfo.pinned === false) {
     pinnedTabBaseUrls.delete(tabId);
   }
@@ -212,21 +227,12 @@ chrome.windows.onRemoved.addListener((windowId) => {
 // --- Feature: Safe Startup Offloading ---
 // =============================================================================
 
-let isTrueBrowserStartup = false;
-
 // This ONLY fires when the browser physically launches (not just SW waking up)
 chrome.runtime.onStartup.addListener(async () => {
-  isTrueBrowserStartup = true;
+  isStartupOffloadActive = true;
   
-  // Give Brave 5 seconds to sort out its session restore, then offload
-  setTimeout(async () => {
-    const tabs = await chrome.tabs.query({ pinned: true });
-    for (const tab of tabs) {
-      // Never discard if it's currently focused or if it's still about:blank
-      if (!tab.active && !tab.discarded && tab.url && tab.url !== "about:blank") {
-        chrome.tabs.discard(tab.id).catch(() => {});
-      }
-    }
-    isTrueBrowserStartup = false;
-  }, 5000);
+  // Disable the startup offload aggressive tracking after 10 seconds
+  setTimeout(() => {
+    isStartupOffloadActive = false;
+  }, 10000);
 });
