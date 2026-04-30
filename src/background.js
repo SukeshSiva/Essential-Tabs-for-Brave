@@ -212,32 +212,25 @@ async function consolidateWindows() {
 
 // --- Ensure all tabs stay in the primary window ---
 
-// When a new window is created, check if it has tabs.
-// If it does, and it's a normal window, move them to the primary window.
-chrome.windows.onCreated.addListener(async (window) => {
+// Debounce consolidation to avoid fighting with Chrome during active drags
+let consolidateTimeout = null;
+
+async function handleWindowChange() {
   const { singleWindowMode } = await chrome.storage.local.get("singleWindowMode");
   if (!singleWindowMode) return;
 
-  if (window.incognito || window.type !== "normal") return;
+  if (consolidateTimeout) clearTimeout(consolidateTimeout);
+  
+  // Wait 100ms for window/tab events to settle (especially during drags)
+  consolidateTimeout = setTimeout(async () => {
+    await consolidateWindows();
+  }, 100);
+}
 
-  if (!primaryWindowId) await initPrimaryWindow();
-  if (!primaryWindowId || window.id === primaryWindowId) return;
-
-  // Wait a tiny bit for the dragged tab to actually attach to the new window
-  setTimeout(async () => {
-    try {
-      const win = await chrome.windows.get(window.id, { populate: true });
-      if (win.tabs && win.tabs.length > 0) {
-        const tabIds = win.tabs.map((t) => t.id);
-        await chrome.tabs.move(tabIds, { windowId: primaryWindowId, index: -1 });
-        await chrome.tabs.update(tabIds[0], { active: true });
-        await chrome.windows.update(primaryWindowId, { focused: true });
-      }
-      // Close the now-empty newly created window
-      chrome.windows.remove(window.id).catch(() => {});
-    } catch {}
-  }, 50); // 50ms is enough for Chrome to attach the tab during a drag
-});
+// Catch any window or tab creation/attachment and merge them
+chrome.windows.onCreated.addListener(handleWindowChange);
+chrome.tabs.onCreated.addListener(handleWindowChange);
+chrome.tabs.onAttached.addListener(handleWindowChange);
 
 // --- If primary window is closed, pick a new one ---
 chrome.windows.onRemoved.addListener((windowId) => {
@@ -246,3 +239,8 @@ chrome.windows.onRemoved.addListener((windowId) => {
     initPrimaryWindow();
   }
 });
+
+// --- Startup Offloading ---
+// Ensure pinned tabs are aggressively offloaded when the browser starts
+chrome.runtime.onStartup.addListener(initPinnedTabs);
+chrome.runtime.onInstalled.addListener(initPinnedTabs);
