@@ -102,8 +102,18 @@ chrome.action.onClicked.addListener(async (tab) => {
         chrome.tabs.update(tab.id, { url: "chrome://newtab" });
         return;
       }
-      // There are active pinned tabs — close normally.
-      // onRemoved will handle creating a background new tab.
+
+      // There are active pinned tabs. We must switch to one BEFORE closing
+      // this tab, otherwise Chrome will auto-activate an offloaded pinned tab.
+      const activePinned = pinnedTabs.find(t => !t.discarded);
+      if (activePinned) {
+        await chrome.tabs.update(activePinned.id, { active: true });
+        // Create a background new tab for later use
+        await chrome.tabs.create({ active: false, windowId: tab.windowId });
+        // Now safe to close — Chrome won't pick a random tab
+        chrome.tabs.remove(tab.id);
+        return;
+      }
     }
     chrome.tabs.remove(tab.id);
   } else {
