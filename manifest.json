@@ -1,10 +1,10 @@
 {
-  "name": "Lock Pinned Tabs",
-  "description": "Prevents pinned a tab from being closed accidentally",
-  "version": "1.0.0",
+  "name": "Essential Tabs for Brave",
+  "description": "Smart pinned tab management — offloading, URL locking, and intelligent tab lifecycle for Brave browser",
+  "version": "2.0.0",
 
-  "author": "gustavotrott",
-  "homepage_url": "https://github.com/gustavotrott/brave-lock-pinned-tabs",
+  "author": "SukeshSiva",
+  "homepage_url": "https://github.com/SukeshSiva/Essential-Tabs-for-Brave",
   "manifest_version": 3,
   "permissions": [
     "tabs",
