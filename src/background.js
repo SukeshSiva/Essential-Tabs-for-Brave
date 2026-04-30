@@ -20,6 +20,10 @@ async function initPinnedTabs() {
   for (const tab of tabs) {
     if (tab.url && tab.id != null) {
       pinnedTabBaseUrls.set(tab.id, getOrigin(tab.url));
+      // Discard the tab to save memory right at startup
+      if (!tab.discarded && !tab.active) {
+        chrome.tabs.discard(tab.id).catch(() => {});
+      }
     }
   }
 }
@@ -208,30 +212,31 @@ async function consolidateWindows() {
 
 // --- Ensure all tabs stay in the primary window ---
 
-async function handleTabEvent() {
+// When a new window is created, check if it has tabs.
+// If it does, and it's a normal window, move them to the primary window.
+chrome.windows.onCreated.addListener(async (window) => {
   const { singleWindowMode } = await chrome.storage.local.get("singleWindowMode");
   if (!singleWindowMode) return;
-  await consolidateWindows();
-}
 
-// When a new window is created, consolidate tabs
-chrome.windows.onCreated.addListener(async (window) => {
   if (window.incognito || window.type !== "normal") return;
-  await handleTabEvent();
-});
 
-// When a tab is created, consolidate tabs
-chrome.tabs.onCreated.addListener(async (tab) => {
-  const win = await chrome.windows.get(tab.windowId);
-  if (win.incognito || win.type !== "normal") return;
-  await handleTabEvent();
-});
+  if (!primaryWindowId) await initPrimaryWindow();
+  if (!primaryWindowId || window.id === primaryWindowId) return;
 
-// When a tab is attached to a window (e.g. dragged out), consolidate tabs
-chrome.tabs.onAttached.addListener(async (tabId, attachInfo) => {
-  const win = await chrome.windows.get(attachInfo.newWindowId);
-  if (win.incognito || win.type !== "normal") return;
-  await handleTabEvent();
+  // Wait a tiny bit for the dragged tab to actually attach to the new window
+  setTimeout(async () => {
+    try {
+      const win = await chrome.windows.get(window.id, { populate: true });
+      if (win.tabs && win.tabs.length > 0) {
+        const tabIds = win.tabs.map((t) => t.id);
+        await chrome.tabs.move(tabIds, { windowId: primaryWindowId, index: -1 });
+        await chrome.tabs.update(tabIds[0], { active: true });
+        await chrome.windows.update(primaryWindowId, { focused: true });
+      }
+      // Close the now-empty newly created window
+      chrome.windows.remove(window.id).catch(() => {});
+    } catch {}
+  }, 50); // 50ms is enough for Chrome to attach the tab during a drag
 });
 
 // --- If primary window is closed, pick a new one ---
