@@ -25,8 +25,11 @@ async function initPinnedTabs() {
     if (url && tab.id != null) {
       pinnedTabBaseUrls.set(tab.id, getOrigin(url));
     }
-    // Discard the tab to save memory right at startup
-    if (!tab.discarded && !tab.active) {
+    
+    // Discard the tab to save memory right at startup, 
+    // but ONLY if the URL is fully committed (not pending or blank)
+    const isCommitted = tab.url && tab.url !== "about:blank" && tab.url !== "";
+    if (isCommitted && !tab.discarded && !tab.active) {
       chrome.tabs.discard(tab.id).catch(() => {});
     }
   }
@@ -76,9 +79,13 @@ chrome.action.onClicked.addListener(async (tab) => {
 // --- Track when a tab becomes pinned or unpinned, or loads its URL ---
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   // Aggressive startup offloading: 
-  // If Brave tries to load a pinned tab within 5 seconds of startup, put it back to sleep
+  // If Brave tries to load a pinned tab within 5 seconds of startup, put it back to sleep,
+  // but ONLY if the URL is fully committed (otherwise session restore breaks and loads about:blank)
   if (tab.pinned && !tab.active && !tab.discarded && (Date.now() - STARTUP_TIME < 5000)) {
-    chrome.tabs.discard(tabId).catch(() => {});
+    const isCommitted = tab.url && tab.url !== "about:blank" && tab.url !== "";
+    if (isCommitted) {
+      chrome.tabs.discard(tabId).catch(() => {});
+    }
   }
 
   const url = changeInfo.pendingUrl || changeInfo.url || tab.pendingUrl || tab.url;
@@ -128,6 +135,8 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
 });
 
 // --- Prevent pinned tabs from navigating away from their base URL ---
+const recentNavigations = new Set();
+
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId !== 0) return;
 
@@ -143,6 +152,12 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
     details.url.startsWith("chrome-extension://")
   )
     return;
+
+  // Prevent duplicate tab creations for the same rapid navigation (redirects/double-clicks)
+  const navKey = `${tabId}:${details.url}`;
+  if (recentNavigations.has(navKey)) return;
+  recentNavigations.add(navKey);
+  setTimeout(() => recentNavigations.delete(navKey), 1000);
 
   chrome.tabs.create({ url: details.url, active: true });
 
