@@ -31,6 +31,10 @@ const ready = (async () => {
         pinnedTabBaseUrls[tab.id] = getOrigin(url);
       }
     }
+    // Protect non-discarded pinned tabs from Brave's auto-discard
+    if (!tab.discarded) {
+      chrome.tabs.update(tab.id, { autoDiscardable: false }).catch(() => {});
+    }
   }
   // Remove stale entries
   for (const id of Object.keys(pinnedTabBaseUrls)) {
@@ -110,7 +114,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     if (nextActive) {
       // There's another active pinned tab — move there first, then offload
       await chrome.tabs.update(nextActive.id, { active: true });
-      chrome.tabs.discard(tab.id).catch(() => {});
+      discardPinnedTab(tab.id);
     } else {
       // No more active pinned tabs — move to an unpinned tab (or create one)
       const unpinnedTabs = await chrome.tabs.query({ windowId: tab.windowId, pinned: false });
@@ -120,7 +124,7 @@ chrome.action.onClicked.addListener(async (tab) => {
         // No unpinned tabs either — create a new tab
         await chrome.tabs.create({ active: true, windowId: tab.windowId });
       }
-      chrome.tabs.discard(tab.id).catch(() => {});
+      discardPinnedTab(tab.id);
     }
   }
 });
@@ -128,6 +132,18 @@ chrome.action.onClicked.addListener(async (tab) => {
 // =============================================================================
 // Track when tabs are pinned/unpinned
 // =============================================================================
+
+/**
+ * Discard a pinned tab. We must temporarily re-enable autoDiscardable
+ * (since we set it to false to block Brave's Memory Saver).
+ */
+async function discardPinnedTab(tabId) {
+  try {
+    await chrome.tabs.update(tabId, { autoDiscardable: true });
+    await chrome.tabs.discard(tabId);
+  } catch {}
+}
+
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   await ready;
 
@@ -138,9 +154,22 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       pinnedTabBaseUrls[tabId] = getOrigin(url);
       save();
     }
+
+    // Prevent Brave's Memory Saver from auto-discarding pinned tabs.
+    // Only our extension should offload them (via discardPinnedTab).
+    if (!tab.discarded && changeInfo.status === "complete") {
+      chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {});
+    }
+  }
+
+  if (changeInfo.pinned === true) {
+    // Newly pinned — protect from auto-discard
+    chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {});
   }
 
   if (changeInfo.pinned === false) {
+    // Unpinned — restore normal auto-discard behavior
+    chrome.tabs.update(tabId, { autoDiscardable: true }).catch(() => {});
     delete pinnedTabBaseUrls[tabId];
     save();
   }
@@ -328,7 +357,7 @@ async function consolidateWindows() {
         });
         for (const pt of pinnedTabs) {
           if (!pt.active && !pt.discarded) {
-            chrome.tabs.discard(pt.id).catch(() => {});
+            discardPinnedTab(pt.id);
           }
         }
       }, 500); // short delay to let the moved tab settle as active first
@@ -414,7 +443,7 @@ chrome.runtime.onStartup.addListener(async () => {
       });
       for (const pt of freshPinned) {
         if (!pt.active && !pt.discarded) {
-          chrome.tabs.discard(pt.id).catch(() => {});
+          discardPinnedTab(pt.id);
         }
       }
     }, 1500);
