@@ -1,24 +1,25 @@
 // =============================================================================
-// Base URL Lock for Pinned Tabs
+// Essential Tabs for Brave - Background Service Worker
 // =============================================================================
 //
-// CRITICAL DESIGN NOTE (MV3):
-// In Manifest V3, the service worker is killed after ~30s of inactivity.
-// When it restarts, ALL in-memory state (Maps, variables) is wiped.
-// We MUST persist pinned tab URLs to chrome.storage.local so the lock
-// survives across service worker restarts.
+// MV3 DESIGN NOTES:
+// 1. Service workers restart frequently. ALL state must be in chrome.storage.
+// 2. Events can fire before async init completes. Handlers must await init.
+// 3. There is NO synchronous way to cancel a navigation in MV3.
+//    We use declarativeNetRequest to block cross-origin requests on pinned
+//    tabs at the network level (synchronous, zero-flash).
 // =============================================================================
 
-// In-memory cache (fast synchronous access for event listeners)
-let pinnedTabUrls = {}; // { tabId: origin }
-
-// Flag for startup offloading
+// In-memory cache — loaded from storage on every service worker wake
+let pinnedTabUrls = {}; // { "tabId": "https://example.com" (origin) }
 let isStartupOffloadActive = false;
 const queuedForDiscard = new Set();
 
-/**
- * Get the origin (base URL) from a full URL.
- */
+// Promise that resolves when our data is ready
+const initDone = init();
+
+// --- Core Utilities ---
+
 function getOrigin(url) {
   try {
     return new URL(url).origin;
@@ -27,29 +28,28 @@ function getOrigin(url) {
   }
 }
 
-/**
- * Save the current pinned tab URLs to persistent storage.
- */
+function getDomain(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
+
 function persistPinnedUrls() {
   chrome.storage.local.set({ pinnedTabUrls });
 }
 
-/**
- * Load pinned tab URLs from persistent storage into memory.
- * This is the FIRST thing that runs when the service worker wakes up.
- */
-async function loadPinnedUrls() {
+// --- Initialization ---
+
+async function init() {
+  // Step 1: Load persisted data (very fast, < 5ms)
   const data = await chrome.storage.local.get("pinnedTabUrls");
   if (data.pinnedTabUrls) {
     pinnedTabUrls = data.pinnedTabUrls;
   }
-}
 
-/**
- * Scan all current pinned tabs and register any that are missing from our map.
- * Also cleans up entries for tabs that no longer exist or aren't pinned.
- */
-async function syncPinnedTabs() {
+  // Step 2: Reconcile with actual browser state
   const tabs = await chrome.tabs.query({ pinned: true });
   const currentPinnedIds = new Set();
 
@@ -57,7 +57,6 @@ async function syncPinnedTabs() {
     const url = tab.pendingUrl || tab.url;
     if (url && url !== "about:blank" && tab.id != null) {
       currentPinnedIds.add(String(tab.id));
-      // Only set if we don't already have a lock for this tab
       if (!pinnedTabUrls[tab.id]) {
         const origin = getOrigin(url);
         if (origin && !origin.startsWith("chrome://")) {
@@ -67,7 +66,7 @@ async function syncPinnedTabs() {
     }
   }
 
-  // Clean up entries for tabs that no longer exist or are no longer pinned
+  // Remove stale entries for tabs that no longer exist/aren't pinned
   for (const tabId of Object.keys(pinnedTabUrls)) {
     if (!currentPinnedIds.has(tabId)) {
       delete pinnedTabUrls[tabId];
@@ -75,10 +74,113 @@ async function syncPinnedTabs() {
   }
 
   persistPinnedUrls();
+
+  // Step 3: Set up DNR blocking rules for all pinned tabs
+  await updateAllDnrRules();
 }
 
-// --- Boot sequence: load from storage FIRST, then sync with real tabs ---
-loadPinnedUrls().then(() => syncPinnedTabs());
+// =============================================================================
+// declarativeNetRequest — the REAL base URL lock
+// =============================================================================
+//
+// DNR rules are evaluated SYNCHRONOUSLY by the browser at the network level,
+// BEFORE the request is made. This means:
+//   - Zero flash (the page never even starts loading)
+//   - Zero reload (the current page is completely untouched)
+//   - Works even if the service worker is asleep (rules persist in session)
+//
+// We create one rule per pinned tab that blocks all main_frame requests
+// EXCEPT those going to the tab's locked domain.
+// =============================================================================
+
+function makeRuleId(tabId) {
+  // DNR rule IDs must be positive integers. Tab IDs are already integers.
+  return Number(tabId);
+}
+
+async function addDnrRuleForTab(tabId, origin) {
+  const domain = getDomain(origin + "/");
+  if (!domain) return;
+
+  const ruleId = makeRuleId(tabId);
+
+  // Remove existing rule for this tab first (in case domain changed)
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [ruleId],
+    addRules: [{
+      id: ruleId,
+      priority: 1,
+      condition: {
+        tabIds: [Number(tabId)],
+        resourceTypes: ["main_frame"],
+        excludedRequestDomains: [domain]
+      },
+      action: {
+        type: "block"
+      }
+    }]
+  }).catch(() => {});
+}
+
+async function removeDnrRuleForTab(tabId) {
+  const ruleId = makeRuleId(tabId);
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [ruleId]
+  }).catch(() => {});
+}
+
+async function updateAllDnrRules() {
+  // Clear all existing session rules
+  const existingRules = await chrome.declarativeNetRequest.getSessionRules();
+  const existingIds = existingRules.map(r => r.id);
+  if (existingIds.length > 0) {
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: existingIds
+    });
+  }
+
+  // Add a rule for each pinned tab
+  for (const [tabId, origin] of Object.entries(pinnedTabUrls)) {
+    await addDnrRuleForTab(tabId, origin);
+  }
+}
+
+// =============================================================================
+// onBeforeNavigate — opens the blocked URL in a new tab
+// =============================================================================
+// DNR blocks the network request (so the pinned tab stays put), but the user
+// still needs the URL to open somewhere. This handler opens it in a new tab.
+
+const recentNavigations = new Set();
+
+chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
+  if (details.frameId !== 0) return;
+  await initDone;
+
+  const tabId = details.tabId;
+  const baseOrigin = pinnedTabUrls[tabId];
+  if (!baseOrigin) return;
+
+  const newOrigin = getOrigin(details.url);
+  if (newOrigin === baseOrigin) return;
+
+  // Allow internal browser pages
+  if (
+    details.url.startsWith("chrome://") ||
+    details.url.startsWith("chrome-extension://") ||
+    details.url.startsWith("brave://")
+  )
+    return;
+
+  // Prevent duplicate tab creations
+  const navKey = `${tabId}:${details.url}`;
+  if (recentNavigations.has(navKey)) return;
+  recentNavigations.add(navKey);
+  setTimeout(() => recentNavigations.delete(navKey), 2000);
+
+  // Open the blocked URL in a new tab
+  chrome.tabs.create({ url: details.url, active: true });
+});
 
 // =============================================================================
 // Extension icon click: offload/cascade
@@ -113,28 +215,31 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 // =============================================================================
-// Track pinned/unpinned state changes + startup offloading
+// Track pinned/unpinned state + startup offloading
 // =============================================================================
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  // --- Handle unpinning: remove the lock ---
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  await initDone;
+
+  // --- Tab was unpinned: remove the lock ---
   if (changeInfo.pinned === false) {
     delete pinnedTabUrls[tabId];
     persistPinnedUrls();
+    await removeDnrRuleForTab(tabId);
     return;
   }
 
-  // --- Handle pinning or loading of a pinned tab ---
+  // --- Tab is pinned: ensure we have a lock ---
   if (tab.pinned) {
     const url = tab.pendingUrl || tab.url;
     const isValidUrl = url && url !== "about:blank" && !url.startsWith("chrome://");
 
-    // Lock the base URL if we don't have one yet for this tab
     if (!pinnedTabUrls[tabId] && isValidUrl) {
       pinnedTabUrls[tabId] = getOrigin(url);
       persistPinnedUrls();
+      await addDnrRuleForTab(tabId, pinnedTabUrls[tabId]);
     }
 
-    // Startup offloading: discard background pinned tabs with a favicon grace period
+    // Startup offloading with favicon grace period
     if (isStartupOffloadActive && !tab.active && !tab.discarded && isValidUrl) {
       if (!queuedForDiscard.has(tabId)) {
         queuedForDiscard.add(tabId);
@@ -155,9 +260,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // Handle tab removal
 // =============================================================================
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
-  // Clean up our tracking
   delete pinnedTabUrls[tabId];
   persistPinnedUrls();
+  await removeDnrRuleForTab(tabId);
 
   if (removeInfo.isWindowClosing) return;
 
@@ -173,63 +278,6 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
       chrome.tabs.create({ active: true, windowId });
     }
   }
-});
-
-// =============================================================================
-// BASE URL LOCK — the core feature
-// =============================================================================
-const recentNavigations = new Set();
-
-// Track the last known good full URL for each pinned tab (for fallback)
-const lastGoodUrl = {};
-
-// Keep track of what page each pinned tab is actually showing
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (tab.pinned && changeInfo.status === "complete" && tab.url) {
-    const origin = getOrigin(tab.url);
-    if (origin && origin === pinnedTabUrls[tabId]) {
-      lastGoodUrl[tabId] = tab.url;
-    }
-  }
-});
-
-chrome.webNavigation.onBeforeNavigate.addListener((details) => {
-  if (details.frameId !== 0) return;
-
-  const tabId = details.tabId;
-  const baseOrigin = pinnedTabUrls[tabId];
-  if (!baseOrigin) return;
-
-  const newOrigin = getOrigin(details.url);
-  if (newOrigin === baseOrigin) return;
-
-  // Allow internal browser pages
-  if (
-    details.url.startsWith("chrome://") ||
-    details.url.startsWith("chrome-extension://") ||
-    details.url.startsWith("brave://")
-  )
-    return;
-
-  // Prevent duplicate tab creations for rapid-fire navigations
-  const navKey = `${tabId}:${details.url}`;
-  if (recentNavigations.has(navKey)) return;
-  recentNavigations.add(navKey);
-  setTimeout(() => recentNavigations.delete(navKey), 2000);
-
-  // Open the blocked URL in a new tab
-  chrome.tabs.create({ url: details.url, active: true });
-
-  // Cancel the navigation on the pinned tab.
-  // window.stop() freezes the page in place without any visible reload.
-  chrome.scripting.executeScript({
-    target: { tabId: tabId },
-    func: () => window.stop()
-  }).catch(() => {
-    // Fallback: navigate back to the exact page they were on (not just the root)
-    const fallbackUrl = lastGoodUrl[tabId] || baseOrigin + "/";
-    chrome.tabs.update(tabId, { url: fallbackUrl });
-  });
 });
 
 // =============================================================================
