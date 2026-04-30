@@ -379,31 +379,45 @@ chrome.windows.onRemoved.addListener((windowId) => {
 // =============================================================================
 // Startup Offloading
 // =============================================================================
-let isStartupOffloadActive = false;
-const queuedForDiscard = new Set();
+// On browser launch:
+//   1. Create a new active tab so the user lands there
+//   2. Offload ALL pinned tabs after a grace period (favicon caching)
+// =============================================================================
 
-chrome.runtime.onStartup.addListener(() => {
-  isStartupOffloadActive = true;
-  setTimeout(() => { isStartupOffloadActive = false; }, 10000);
-});
+chrome.runtime.onStartup.addListener(async () => {
+  // Wait a moment for Brave to finish restoring the session
+  setTimeout(async () => {
+    const allWindows = await chrome.windows.getAll({ windowTypes: ["normal"], populate: true });
+    const mainWindow = allWindows.find(w => !w.incognito);
+    if (!mainWindow) return;
 
-// Hook into the existing onUpdated listener to offload during startup
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (!isStartupOffloadActive) return;
-  if (!tab.pinned || tab.active || tab.discarded) return;
+    const pinnedTabs = mainWindow.tabs.filter(t => t.pinned);
+    if (pinnedTabs.length === 0) return;
 
-  const url = tab.pendingUrl || tab.url;
-  if (!url || url === "about:blank") return;
+    // Create a new tab so the user has somewhere to land
+    const unpinnedTabs = mainWindow.tabs.filter(t => !t.pinned);
+    if (unpinnedTabs.length === 0) {
+      await chrome.tabs.create({ active: true, windowId: mainWindow.id });
+    } else {
+      // Make sure the user is on an unpinned tab, not a pinned one
+      const activeTab = mainWindow.tabs.find(t => t.active);
+      if (activeTab && activeTab.pinned) {
+        await chrome.tabs.update(unpinnedTabs[0].id, { active: true });
+      }
+    }
 
-  if (!queuedForDiscard.has(tabId)) {
-    queuedForDiscard.add(tabId);
-    setTimeout(() => {
-      chrome.tabs.get(tabId, (t) => {
-        if (chrome.runtime.lastError) return;
-        if (t && !t.active && !t.discarded) {
-          chrome.tabs.discard(tabId).catch(() => {});
-        }
+    // Now offload all pinned tabs after a grace period for favicon caching
+    setTimeout(async () => {
+      const freshPinned = await chrome.tabs.query({
+        windowId: mainWindow.id,
+        pinned: true,
       });
-    }, 1500); // Grace period for favicon caching
-  }
+      for (const pt of freshPinned) {
+        if (!pt.active && !pt.discarded) {
+          chrome.tabs.discard(pt.id).catch(() => {});
+        }
+      }
+    }, 1500);
+  }, 500); // wait for session restore
 });
+
