@@ -10,7 +10,8 @@
     "tabs",
     "webNavigation",
     "contextMenus",
-    "storage"
+    "storage",
+    "scripting"
   ],
   "icons": {
     "128": "images/icon_128.png"

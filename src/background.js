@@ -149,9 +149,14 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
 
   chrome.tabs.create({ url: details.url, active: true });
 
-  // Abort the pending navigation immediately (zero flash)
-  chrome.tabs.goBack(tabId).catch(() => {
-    chrome.tabs.update(tabId, { url: baseOrigin + "/" });
+  // Abort the pending navigation immediately without reloading or flashing
+  // We use window.stop() via scripting to freeze the page exactly where it is.
+  chrome.scripting.executeScript({
+    target: { tabId: tabId },
+    func: () => window.stop()
+  }).catch(() => {
+    // Fallback if scripting fails (e.g., chrome:// URLs which we shouldn't be on anyway)
+    chrome.tabs.goBack(tabId).catch(() => {});
   });
 });
 
