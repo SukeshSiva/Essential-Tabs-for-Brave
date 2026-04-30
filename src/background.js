@@ -4,6 +4,7 @@
 // Simple, reliable pinned tab management.
 // - Base URL lock (pinned tabs can't navigate away from their origin)
 // - Offload cascade (extension icon click offloads pinned tabs)
+// - Smart tab close (last tab resets instead of closing)
 // - Single window mode (optional, toggle via right-click)
 // - Startup offloading (pinned tabs auto-offload on browser launch)
 // =============================================================================
@@ -46,36 +47,80 @@ function getOrigin(url) {
   try { return new URL(url).origin; } catch { return null; }
 }
 
+/** Check if a URL is a "new tab" page (blank or chrome://newtab variants) */
+function isNewTabPage(url) {
+  if (!url) return true;
+  return (
+    url === "chrome://newtab/" ||
+    url === "chrome://newtab" ||
+    url === "brave://newtab/" ||
+    url === "brave://newtab" ||
+    url === "about:blank" ||
+    url === ""
+  );
+}
+
 // =============================================================================
-// Extension icon click — offload/cascade
+// Extension icon click — close / offload / reset
+// =============================================================================
+//
+// FLOW (the user's exact desired behavior):
+//
+// Normal tabs exist → close normally
+// Last normal tab closed → focus moves to pinned tab, new tab created in bg
+//   (this is handled by onRemoved below)
+// On a pinned tab → offload it, cascade to next active pinned tab
+// Last pinned tab → offload it, move to the new tab
+// On the new tab with a URL loaded, all pinned offloaded → RESET to fresh
+//   new tab (clear history) instead of closing
+// On a fresh new tab, all pinned offloaded → do nothing (already fresh)
+//
 // =============================================================================
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.pinned) {
-    // Normal tab: close it (unless it's the last one with all pinned offloaded)
+    // --- Normal (unpinned) tab ---
     const unpinnedTabs = await chrome.tabs.query({ windowId: tab.windowId, pinned: false });
+
     if (unpinnedTabs.length <= 1) {
+      // This is the LAST unpinned tab
       const pinnedTabs = await chrome.tabs.query({ windowId: tab.windowId, pinned: true });
       const allPinnedOffloaded = pinnedTabs.length > 0 && pinnedTabs.every(t => t.discarded);
-      if (allPinnedOffloaded) {
+      const noPinnedTabs = pinnedTabs.length === 0;
+
+      if (allPinnedOffloaded || noPinnedTabs) {
+        // All pinned tabs are sleeping (or none exist).
+        // Can't close — would wake a pinned tab or close the window.
+        if (isNewTabPage(tab.url)) {
+          // Already a fresh new tab — do nothing
+          return;
+        }
+        // Has a real URL loaded — reset it to a fresh new tab
         chrome.tabs.update(tab.id, { url: "chrome://newtab" });
         return;
       }
+      // There are active pinned tabs — close normally.
+      // onRemoved will handle creating a background new tab.
     }
     chrome.tabs.remove(tab.id);
   } else {
-    // Pinned tab: offload it, cascade to next
+    // --- Pinned tab: offload it, cascade to next ---
     const pinnedTabs = await chrome.tabs.query({ windowId: tab.windowId, pinned: true });
     const nextActive = pinnedTabs.find(t => t.id !== tab.id && !t.discarded);
 
     if (nextActive) {
+      // There's another active pinned tab — move there first, then offload
       await chrome.tabs.update(nextActive.id, { active: true });
       chrome.tabs.discard(tab.id).catch(() => {});
     } else {
+      // No more active pinned tabs — move to an unpinned tab (or create one)
       const unpinnedTabs = await chrome.tabs.query({ windowId: tab.windowId, pinned: false });
       if (unpinnedTabs.length > 0) {
         await chrome.tabs.update(unpinnedTabs[0].id, { active: true });
-        chrome.tabs.discard(tab.id).catch(() => {});
+      } else {
+        // No unpinned tabs either — create a new tab
+        await chrome.tabs.create({ active: true, windowId: tab.windowId });
       }
+      chrome.tabs.discard(tab.id).catch(() => {});
     }
   }
 });
@@ -103,6 +148,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
 // =============================================================================
 // Handle tab removal — keep a normal tab alive
+// =============================================================================
+// When the last normal tab is closed:
+//   - If there are active pinned tabs → create a background new tab (user stays
+//     on pinned tab)
+//   - If all pinned tabs are offloaded → create an ACTIVE new tab (user lands
+//     there)
 // =============================================================================
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   delete pinnedTabBaseUrls[tabId];
@@ -170,6 +221,10 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
 // =============================================================================
 // Single Window Mode
 // =============================================================================
+// When enabled, all tabs from secondary normal windows are merged into the
+// primary window. Detaching tabs (dragging them out) triggers an immediate
+// re-merge. Private/Tor/incognito windows are excluded.
+// =============================================================================
 let primaryWindowId = null;
 
 async function initPrimaryWindow() {
@@ -205,39 +260,97 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
   if (newVal) consolidateWindows();
 });
 
+/**
+ * Move all tabs from other normal (non-incognito) windows into the primary
+ * window. If a move fails (e.g. user is mid-drag), retry with increasing
+ * delay up to a max number of attempts.
+ */
+let consolidateRetries = 0;
+const MAX_RETRIES = 15; // ~4.5 seconds total (100ms * 15 with backoff)
+
 async function consolidateWindows() {
   if (!primaryWindowId) await initPrimaryWindow();
   if (!primaryWindowId) return;
 
+  // Verify primary window still exists
+  try {
+    await chrome.windows.get(primaryWindowId);
+  } catch {
+    primaryWindowId = null;
+    await initPrimaryWindow();
+    if (!primaryWindowId) return;
+  }
+
   const wins = await chrome.windows.getAll({ windowTypes: ["normal"], populate: true });
-  let retry = false;
+  let needsRetry = false;
 
   for (const win of wins) {
     if (win.id === primaryWindowId || win.incognito) continue;
-    const ids = win.tabs.map(t => t.id);
-    if (ids.length > 0) {
-      try {
-        await chrome.tabs.move(ids, { windowId: primaryWindowId, index: -1 });
-      } catch { retry = true; }
+    const tabIds = win.tabs.map(t => t.id);
+    if (tabIds.length === 0) continue;
+
+    try {
+      await chrome.tabs.move(tabIds, { windowId: primaryWindowId, index: -1 });
+    } catch {
+      needsRetry = true;
     }
   }
 
-  if (retry) setTimeout(consolidateWindows, 300);
-  else if (wins.length > 1) chrome.windows.update(primaryWindowId, { focused: true }).catch(() => {});
+  // Close any empty leftover windows
+  const updatedWins = await chrome.windows.getAll({ windowTypes: ["normal"], populate: true });
+  for (const win of updatedWins) {
+    if (win.id === primaryWindowId || win.incognito) continue;
+    if (win.tabs.length === 0) {
+      chrome.windows.remove(win.id).catch(() => {});
+    }
+  }
+
+  if (needsRetry && consolidateRetries < MAX_RETRIES) {
+    consolidateRetries++;
+    const delay = Math.min(100 + consolidateRetries * 50, 500);
+    setTimeout(consolidateWindows, delay);
+  } else {
+    consolidateRetries = 0;
+    // Focus the primary window after successful merge
+    if (!needsRetry) {
+      chrome.windows.update(primaryWindowId, { focused: true }).catch(() => {});
+    }
+  }
 }
 
+// --- Debounced handler for window/tab events ---
 let consolidateTimeout = null;
 async function handleWindowChange() {
   const { singleWindowMode } = await chrome.storage.local.get("singleWindowMode");
   if (!singleWindowMode) return;
   if (consolidateTimeout) clearTimeout(consolidateTimeout);
-  consolidateTimeout = setTimeout(consolidateWindows, 100);
+  consolidateTimeout = setTimeout(() => {
+    consolidateRetries = 0; // reset retries for new event
+    consolidateWindows();
+  }, 100);
 }
 
+// Listen to all events that could mean a tab ended up in a new window
 chrome.windows.onCreated.addListener(handleWindowChange);
 chrome.tabs.onCreated.addListener(handleWindowChange);
 chrome.tabs.onAttached.addListener(handleWindowChange);
 
+// --- Catch tab detach specifically (drag-out) ---
+// When a tab is detached from the primary window, it's about to land in a
+// new window. We aggressively trigger consolidation to pull it back.
+chrome.tabs.onDetached.addListener(async (tabId, detachInfo) => {
+  const { singleWindowMode } = await chrome.storage.local.get("singleWindowMode");
+  if (!singleWindowMode) return;
+
+  // The tab was pulled out of a window. Give it a moment to land in the
+  // new window, then aggressively consolidate.
+  if (consolidateTimeout) clearTimeout(consolidateTimeout);
+  consolidateRetries = 0;
+  // Start quickly (50ms) — the new window is being created right now
+  consolidateTimeout = setTimeout(consolidateWindows, 50);
+});
+
+// --- If primary window is closed, pick a new one ---
 chrome.windows.onRemoved.addListener((windowId) => {
   if (windowId === primaryWindowId) {
     primaryWindowId = null;
